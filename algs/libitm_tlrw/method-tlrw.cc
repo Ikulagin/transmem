@@ -1,4 +1,3 @@
-#include <stdio.h>
 #include <stdlib.h>
 
 #include "libitm_i.h"
@@ -59,32 +58,17 @@ struct tlrw_mg : public method_group
 
   virtual void init()
   {
-    // We assume that an atomic<gtm_word> is backed by just a gtm_word, so
-    // starting with zeroed memory is fine.
     bytelocks = (bytelock_t*) xcalloc(
         sizeof(bytelock_t) * L2O_BYTELOCK, true);
   }
 
   virtual void fini()
   {
-      for (unsigned int i = 0; i < L2O_BYTELOCK; i++) {
-          if (bytelocks[i].owner.load() != 0)
-              printf("%s:%d error due to writer!\n", __func__, __LINE__);
-          for (unsigned int j = 0; j < BYTE_ARRAY_FIELD_SIZE; j++) {
-              if (bytelocks[i].byte_array[j] != 0)
-                  printf("%s:%d error due to reader!\n", __func__, __LINE__);
-          }
-      }
       free(bytelocks);
   }
 
-  // NOTE!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! May be not neccessary.
-  // We only re-initialize when our time base overflows.  Thus, only reset
-  // the time base and the orecs but do not re-allocate the orec array.
   virtual void reinit()
   {
-    // This store is only executed while holding the serial lock, so relaxed
-    // memory order is sufficient here.  Same holds for the memset.
     memset(bytelocks, 0, sizeof(bytelock_t) * L2O_BYTELOCK);
   }
 };
