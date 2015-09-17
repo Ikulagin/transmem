@@ -46,14 +46,15 @@ struct tlrw_mg : public method_group
         & (L2O_BYTELOCK - 1);
   }
 
-  static bool lookup_bytelocks_log(size_t el, vector<size_t>::iterator begin,
+  static vector<size_t>::iterator lookup_bytelocks_log(size_t el,
+                                   vector<size_t>::iterator begin,
                                    vector<size_t>::iterator end)
   {
       for ( ; begin != end; begin++)
           if (*begin == el)
-              return true;
+              return begin;
 
-      return false;
+      return NULL;
   }
 
   virtual void init()
@@ -82,6 +83,7 @@ protected:
   {
       unsigned thread_id = tx->thread_id;
       bytelock_t *&bls = o_tlrw_mg.bytelocks;
+      bool slotted = thread_id - 1 < NUMBER_SLOTTED_THREADS ? true : false;
       int tries = 0;
 
       /*
@@ -105,13 +107,15 @@ protected:
 
               // If current thread is unslotted, we need decrease the reader_counter,
               // if the thread is reader.
-              if (thread_id < NUMBER_SLOTTED_THREADS) {
-                  bls[bl].byte_array[thread_id] = 0;
+              if (slotted) {
+                  bls[bl].byte_array[thread_id - 1] = 0;
               } else {
-                  if (tlrw_mg::lookup_bytelocks_log(bl,
+                  vector<size_t>::iterator read_bl = NULL;
+                  if ((read_bl = tlrw_mg::lookup_bytelocks_log(bl,
                                  tx->readbytelocks.begin(),
-                                 tx->readbytelocks.end()) == true) {
-                      bls[bl].reader_counter--;
+                                 tx->readbytelocks.end())) != NULL) {
+                      bls[bl].reader_counter.fetch_sub(1);
+                      *read_bl = tlrw_mg::L2O_BYTELOCK;
                   }
               }
 
@@ -144,7 +148,7 @@ protected:
       size_t len)
   {
       unsigned thread_id = tx->thread_id;
-      bool slotted = thread_id < NUMBER_SLOTTED_THREADS ? true : false;
+      bool slotted = thread_id - 1 < NUMBER_SLOTTED_THREADS ? true : false;
       bytelock_t *&bls = o_tlrw_mg.bytelocks;
       int tries = 0;
 
@@ -155,35 +159,35 @@ protected:
       size_t bl_end = tlrw_mg::get_bytelock_end(addr, len);
       do {
           if (bls[bl].owner.load(memory_order_relaxed) != thread_id) {
-              if (slotted && (bls[bl].byte_array[thread_id] == 1)) {
+              if (slotted && (bls[bl].byte_array[thread_id - 1] == 1)) {
                   bl = o_tlrw_mg.get_next_bytelock(bl);
                   continue;
               }
 
               if (unlikely(!slotted && (tlrw_mg::lookup_bytelocks_log(bl,
                                    tx->readbytelocks.begin(),
-                                   tx->readbytelocks.end()) == true))) {
+                                   tx->readbytelocks.end()) != NULL))) {
                   bl = o_tlrw_mg.get_next_bytelock(bl);
                   continue;
               }
 
               while (true) {
                   if (likely(slotted)) {
-                      bls[bl].byte_array[thread_id] = 1;
+                      bls[bl].byte_array[thread_id - 1] = 1;
                       atomic_thread_fence(memory_order_release);
                   } else {
-                      bls[bl].reader_counter++;
+                      bls[bl].reader_counter.fetch_add(1);
                   }
           
-                  if (bls[bl].owner.load(memory_order_seq_cst) == 0) {
+                  if (bls[bl].owner.load(memory_order_acquire) == 0) {
                       break;
                   }
           
                   if (likely(slotted)) {
-                      bls[bl].byte_array[thread_id] = 0;
+                      bls[bl].byte_array[thread_id - 1] = 0;
                       atomic_thread_fence(memory_order_release);
                   } else {
-                      bls[bl].reader_counter--;
+                      bls[bl].reader_counter.fetch_sub(1);
                   }
 
                   tries = 0;
@@ -194,9 +198,10 @@ protected:
                       }
                   }
               }
+              size_t *e = tx->readbytelocks.push();
+              *e = bl;
           }
-          size_t *e = tx->readbytelocks.push();
-          *e = bl;
+
           bl = o_tlrw_mg.get_next_bytelock(bl);
       } while (bl != bl_end);
 
@@ -275,21 +280,22 @@ public:
   {
       gtm_thread *tx = gtm_thr();
       unsigned thread_id = tx->thread_id;
-      bool slotted = thread_id < NUMBER_SLOTTED_THREADS ? true : false;
+      bool slotted = thread_id - 1 < NUMBER_SLOTTED_THREADS ? true : false;
       bytelock_t *&bls = o_tlrw_mg.bytelocks;
 
       for (size_t *i = tx->writebytelocks.begin(),
                *ie = tx->writebytelocks.end(); i != ie; i++) {
-          bls[*i].owner.store(0, memory_order_seq_cst);
+          bls[*i].owner.store(0, memory_order_release);
       }
 
       for (size_t *i = tx->readbytelocks.begin(),
                *ie = tx->readbytelocks.end(); i != ie; i++) {
           if (slotted) {
-              bls[*i].byte_array[thread_id] = 0;
-              atomic_thread_fence(memory_order_seq_cst);
+              bls[*i].byte_array[thread_id - 1] = 0;
+              atomic_thread_fence(memory_order_release);
           } else {
-              bls[*i].reader_counter--;
+              if (*i == tlrw_mg::L2O_BYTELOCK) continue;
+              bls[*i].reader_counter.fetch_sub(1);
           }
       }
       
@@ -303,21 +309,22 @@ public:
   {
       gtm_thread *tx = gtm_thr();
       unsigned thread_id = tx->thread_id;
-      bool slotted = thread_id < NUMBER_SLOTTED_THREADS ? true : false;
+      bool slotted = thread_id - 1 < NUMBER_SLOTTED_THREADS ? true : false;
       bytelock_t *&bls = o_tlrw_mg.bytelocks;
 
       for (size_t *i = tx->writebytelocks.begin(),
                *ie = tx->writebytelocks.end(); i != ie; i++) {
-          bls[*i].owner.store(0, memory_order_seq_cst);
+          bls[*i].owner.store(0, memory_order_release);
       }
 
       for (size_t *i = tx->readbytelocks.begin(),
                *ie = tx->readbytelocks.end(); i != ie; i++) {
           if (slotted) {
-              bls[*i].byte_array[thread_id] = 0;
-              atomic_thread_fence(memory_order_seq_cst);
+              bls[*i].byte_array[thread_id - 1] = 0;
+              atomic_thread_fence(memory_order_release);
           } else {
-              bls[*i].reader_counter--;
+              if (*i == tlrw_mg::L2O_BYTELOCK) continue;
+              bls[*i].reader_counter.fetch_sub(1);
           }
       }
       
